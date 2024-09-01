@@ -1,0 +1,222 @@
+#include <Arduino.h>
+#include <SPIFFS.h>
+#include <FS.h>
+#include <driver/i2s.h>
+#include <math.h>
+
+// number of frames to try and send at once (a frame is a left and right sample)
+#define NUM_FRAMES_TO_SEND 128
+// Define the pins for I2S for audio amplifier(MAX98357A)
+#define MAX98357A_DIN_PIN 26
+#define MAX98357A_BCLK_PIN 27
+#define MAX98357A_LRC_PIN 14
+
+typedef struct {
+  uint16_t right;
+  uint16_t left;
+} Frame_t;
+
+typedef struct {
+    // RIFF Header
+    char riff_header[4]; // Contains "RIFF"
+    int wav_size;        // Size of the wav portion of the file, which follows the first 8 bytes. File size - 8
+    char wave_header[4]; // Contains "WAVE"
+
+    // Format Header
+    char fmt_header[4]; // Contains "fmt " (includes trailing space)
+    int fmt_chunk_size; // Should be 16 for PCM
+    short audio_format; // Should be 1 for PCM. 3 for IEEE Float
+    short num_channels;
+    int sample_rate;
+    int byte_rate;          // Number of bytes per second. sample_rate * num_channels * Bytes Per Sample
+    short sample_alignment; // num_channels * Bytes Per Sample
+    short bit_depth;        // Number of bits per sample
+
+    // Data
+    char data_header[4]; // Contains "data"
+    int data_bytes;      // Number of bytes in data. Number of samples * num_channels * sample byte size
+    // uint8_t bytes[]; // Remainder of wave file is bytes
+} wav_header_t;
+
+class SampleSource{
+    public:
+    virtual int sampleRate() = 0;
+    // this should fill the samples buffer with the specified number of frames
+     // A frame contains a LEFT and a RIGHT sample. Each sample should be signed 16 bits
+    virtual void getFrames(Frame_t *frames, int number_frames) = 0;
+};
+
+class WAVFileReader : public SampleSource{
+    private:
+        int m_num_channels;
+        int m_sample_rate;
+        File m_file;
+    public:
+        WAVFileReader(const char *filename);
+        ~WAVFileReader();
+        int sampleRate() { return m_sample_rate; }
+        void getFrames(Frame_t *frames, int number_frames);
+};
+class DACOutput{
+    private:
+        // I2S write task
+        TaskHandle_t m_i2sWriterTaskHandle;
+        // i2s writer queue
+        QueueHandle_t m_i2sQueue;
+        // src of samples for us to play
+        SampleSource *m_sample_generator;
+    public:
+    void start(SampleSource *sample_generator);
+    friend void i2sWriterTask(void *param);
+};
+
+WAVFileReader::WAVFileReader(const char *file_name)
+{
+    if (!SPIFFS.exists(file_name))
+    {
+        Serial.println("****** Failed to open file! Have you uploaed the file system?");
+        return;
+    }
+    m_file = SPIFFS.open(file_name, "r");
+    // read the WAV header
+    wav_header_t wav_header;
+    m_file.read((uint8_t *)&wav_header, sizeof(wav_header_t));
+    // sanity check the bit depth
+    if (wav_header.bit_depth != 16)
+    {
+        Serial.printf("ERROR: bit depth %d is not supported\n", wav_header.bit_depth);
+    }
+
+    Serial.printf("fmt_chunk_size=%d, audio_format=%d, num_channels=%d, sample_rate=%d, sample_alignment=%d, bit_depth=%d, data_bytes=%d\n",
+                  wav_header.fmt_chunk_size, wav_header.audio_format, wav_header.num_channels, wav_header.sample_rate, wav_header.sample_alignment, wav_header.bit_depth, wav_header.data_bytes);
+
+    m_num_channels = wav_header.num_channels;
+    m_sample_rate = wav_header.sample_rate;
+}
+void WAVFileReader::getFrames(Frame_t *frames, int number_frames)
+{
+    // fill the buffer with data from the file wrapping around if necessary
+    for (int i = 0; i < number_frames; i++)
+    {
+        // if we've reached the end of the file then seek back to the beginning (after the header)
+        if (m_file.available() == 0)
+        {
+            m_file.seek(44);
+        }
+        int16_t left;
+        int16_t right;
+        // read in the next sample to the left channel
+        m_file.read((uint8_t *)(&left), sizeof(int16_t));
+        // if we only have one channel duplicate the sample for the right channel
+        if (m_num_channels == 1)
+        {
+            right = left;
+        }
+        else
+        {
+            // otherwise read in the right channel sample
+            m_file.read((uint8_t *)(&right), sizeof(int16_t));
+        }
+        // we need unsigned bytes for the ADC
+        frames[i].left = left + 32768;
+        frames[i].right = right + 32768;
+    }
+}
+void i2sWriterTask(void *param)
+{
+    DACOutput *output = (DACOutput *)param;
+    int availableBytes = 0;
+    int buffer_position = 0;
+    Frame_t frames[128];
+    while (true)
+    {
+        // wait for some data to be requested
+        i2s_event_t evt;
+        if (xQueueReceive(output->m_i2sQueue, &evt, portMAX_DELAY) == pdPASS)
+        {
+            if (evt.type == I2S_EVENT_TX_DONE)
+            {
+                size_t bytesWritten = 0;
+                do
+                {
+                    if (availableBytes == 0)
+                    {
+                        // get some frames from the wave file - a frame consists of a 16 bit left and right sample
+                        output->m_sample_generator->getFrames(frames, NUM_FRAMES_TO_SEND);
+                        // how many bytes do we now have to send
+                        availableBytes = NUM_FRAMES_TO_SEND * sizeof(uint32_t);
+                        // reset the buffer position back to the start
+                        buffer_position = 0;
+                    }
+                    // do we have something to write?
+                    if (availableBytes > 0)
+                    {
+                        // write data to the i2s peripheral
+                        i2s_write(I2S_NUM_0, buffer_position + (uint8_t *)frames,
+                                  availableBytes, &bytesWritten, portMAX_DELAY);
+                        availableBytes -= bytesWritten;
+                        buffer_position += bytesWritten;
+                    }
+                } while (bytesWritten > 0);
+            }
+        }
+    }
+}
+
+void DACOutput::start(SampleSource *sample_generator)
+{
+    m_sample_generator = sample_generator;
+    // i2s config for writing both channels of I2S
+    i2s_config_t i2sConfig = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_DAC_BUILT_IN),
+        .sample_rate = static_cast<uint32_t>(m_sample_generator->sampleRate()),
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 64};
+    // i2s pin configuration
+i2s_pin_config_t pin_config = {
+  .bck_io_num = MAX98357A_BCLK_PIN,
+  .ws_io_num = MAX98357A_LRC_PIN,
+  .data_out_num = MAX98357A_DIN_PIN,
+  .data_in_num = I2S_PIN_NO_CHANGE
+};
+
+    //install and start i2s driver
+    i2s_driver_install(I2S_NUM_0, &i2sConfig, 4, &m_i2sQueue);
+    // set up the pin configuration
+     i2s_set_pin(I2S_NUM_0, &pin_config);
+    // enable the DAC channels
+    i2s_set_dac_mode(I2S_DAC_CHANNEL_BOTH_EN);
+    // clear the DMA buffers
+    i2s_zero_dma_buffer(I2S_NUM_0);
+    // start a task to write samples to the i2s peripheral
+    TaskHandle_t writerTaskHandle;
+    xTaskCreate(i2sWriterTask, "i2s Writer Task", 4096, this, 1, &writerTaskHandle);
+}
+
+SampleSource *sampleSource;
+DACOutput *output;
+
+void setup(){
+    Serial.begin(115200);
+    Serial.println("Starting...");
+    // Initialize SPIFFS
+    if (!SPIFFS.begin())
+    {
+        Serial.println("An Error has occurred while mounting SPIFFS");
+        return;
+    }
+    Serial.println("SPIFFS mounted successfully");
+    Serial.println("Created sample source");
+    sampleSource = new WAVFileReader("/Hello.wav");
+
+    Serial.println("Created DAC output");
+    output = new DACOutput();
+    output->start(sampleSource);
+}
+void loop(){
+    //nothing to do here
+}
